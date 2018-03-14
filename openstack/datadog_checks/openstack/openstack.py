@@ -119,6 +119,93 @@ class MissingNeutronEndpoint(MissingEndpoint):
 class KeystoneUnreachable(Exception):
     pass
 
+class OpenStackUnscoped(object):
+    def __init__(self, auth_token, service_catalog):
+        self.auth_token = auth_token
+        self.service_catalog = service_catalog
+
+    @classmethod
+    def from_config(cls, init_config, instance_config, proxy_config=None):
+        keystone_server_url = init_config.get("keystone_server_url")
+        if not keystone_server_url:
+            raise IncompleteConfig()
+
+        ssl_verify = init_config.get("ssl_verify", False)
+        nova_api_version = init_config.get("nova_api_version", DEFAULT_NOVA_API_VERSION)
+
+        identity = cls.get_user_identity(instance_config)
+
+        exception_msg = None
+        try:
+            auth_resp = cls.request_auth_token(identity, keystone_server_url, ssl_verify, proxy_config)
+        except (requests.exceptions.HTTPError, requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            exception_msg = "Failed keystone auth with user:{user} domain:{domain} @{url}".format(
+                user=identity['password']['user']['name'],
+                domain=identity['password']['user']['domain']['id'],
+                url=keystone_server_url)
+
+        if exception_msg:
+            try:
+                identity['password']['user']['domain']['name'] = identity['password']['user']['domain'].pop('id')
+                auth_resp = cls.request_auth_token(identity, keystone_server_url, ssl_verify, proxy_config)
+            except (requests.exceptions.HTTPError, requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                exception_msg = "{msg} and also failed keystone auth with identity:{id} domain:{domain} @{url}: {ex}".format(
+                    msg=exception_msg,
+                    user=identity['password']['user']['name'],
+                    domain = identity['password']['user']['domain']['name'],
+                    url=keystone_server_url,
+                    ex=e)
+                raise KeystoneUnreachable(exception_msg)
+
+        auth_token = auth_resp.headers.get('X-Subject-Token')
+
+        try:
+            service_catalog = KeystoneCatalog.from_auth_response(
+                auth_resp.json(), nova_api_version
+            )
+        except MissingNovaEndpoint:
+            service_catalog = KeystoneCatalog.from_auth_response(
+                auth_resp.json(), FALLBACK_NOVA_API_VERSION
+            )
+
+        return cls(auth_token, auth_scope, service_catalog)
+
+    @classmethod
+    def get_user_identity(cls, instance_config):
+        """
+        Parse user identity out of init_config
+
+        To guarantee a uniquely identifiable user, expects
+        {"user": {"name": "my_username", "password": "my_password",
+                  "domain": {"id": "my_domain_id"}
+                  }
+        }
+        """
+        user = instance_config.get('user')
+        if not user\
+                or not user.get('name')\
+                or not user.get('password')\
+                or not user.get("domain")\
+                or not user.get("domain").get("id"):
+
+            raise IncompleteIdentity()
+
+        identity = {
+            "methods": ['password'],
+            "password": {"user": user}
+        }
+        return identity
+
+    @classmethod
+    def request_auth_token(cls, identity, keystone_server_url, ssl_verify, proxy=None):
+        payload = {'auth': {'identity': identity, 'scope': 'unscoped'}}
+        auth_url = urljoin(keystone_server_url, "{0}/auth/tokens".format(DEFAULT_KEYSTONE_API_VERSION))
+        headers = {'Content-Type': 'application/json'}
+
+        resp = requests.post(auth_url, headers=headers, data=json.dumps(payload), verify=ssl_verify, timeout=DEFAULT_API_REQUEST_TIMEOUT, proxies=proxy)
+        resp.raise_for_status()
+
+        return resp
 
 class OpenStackProjectScope(object):
     """
@@ -774,7 +861,11 @@ class OpenStackCheck(AgentCheck):
             # We're missing a project scope for this instance
             # Let's populate it now
             try:
-                instance_scope = OpenStackProjectScope.from_config(self.init_config, instance, self.proxy_config)
+                if 'auth_scope' in instance:
+                    instance_scope = OpenStackProjectScope.from_config(self.init_config, instance, self.proxy_config)
+                else:
+                    instance_scope = OpenStackUnscoped.from_config(self.init_config, instance, self.proxy_config)
+
                 self.service_check(self.IDENTITY_API_SC, AgentCheck.OK, tags=["server:%s" % self.init_config.get("keystone_server_url")])
             except KeystoneUnreachable as e:
                 self.warning("The agent could not contact the specified identity server at %s . Are you sure it is up at that address?" % self.init_config.get("keystone_server_url"))
@@ -824,7 +915,7 @@ class OpenStackCheck(AgentCheck):
             project = self.get_scoped_project(instance)
             projects = []
 
-            if collect_all_projects:
+            if collect_all_projects or project is None:
                 projects = self.get_all_projects(instance)
             else:
                 projects.append(project)
@@ -836,10 +927,13 @@ class OpenStackCheck(AgentCheck):
 
             for sid in server_ids:
                 server_tags = ["nova_managed_server"]
-                if instance_scope.tenant_id:
-                    server_tags.append("tenant_id:%s" % instance_scope.tenant_id)
-                if project and 'name' in project:
-                    server_tags.append('project_name:{0}'.format(project['name']))
+
+                # TODO: work on the tagging for unscoped scopes - currently disabled 
+                if isinstance(instance_scope, OpenStackProjectScope):
+                    if instance_scope.tenant_id:
+                        server_tags.append("tenant_id:%s" % instance_scope.tenant_id)
+                    if project and 'name' in project:
+                        server_tags.append('project_name:{0}'.format(project['name']))
 
                 self.external_host_tags[sid] = host_tags
                 self.get_stats_for_single_server(sid, tags=server_tags)
@@ -905,6 +999,10 @@ class OpenStackCheck(AgentCheck):
         Returns the project that this instance of the check is scoped to
         """
         project_auth_scope = self.get_scope_for_instance(instance)
+
+        if isinstance(project_auth_scope, OpenstackUnscoped):
+            return None
+
         filter_params = {}
         url = "{0}/{1}/{2}".format(self.keystone_server_url, DEFAULT_KEYSTONE_API_VERSION, "projects")
         if project_auth_scope.tenant_id:
