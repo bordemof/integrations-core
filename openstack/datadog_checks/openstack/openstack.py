@@ -462,7 +462,7 @@ class OpenStackCheck(AgentCheck):
 
         return self.get_scope_for_instance(instance).service_catalog.neutron_endpoint
 
-    def get_network_stats(self, tags=[]):
+    def get_network_stats(self, tags):
         """
         Collect stats for all reachable networks
         """
@@ -735,7 +735,7 @@ class OpenStackCheck(AgentCheck):
         return self._aggregate_list
     ###
 
-    def _send_api_service_checks(self, instance_scope, tags=[]):
+    def _send_api_service_checks(self, instance_scope, tags):
         # Nova
         headers = {"X-Auth-Token": instance_scope.auth_token}
 
