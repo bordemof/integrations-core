@@ -356,7 +356,7 @@ class TestOpenstack(AgentCheckTest):
             self.check.exclude_network_id_rules = set([re.compile(rule) for rule in self.EXCLUDED_NETWORK_IDS])
 
             # Retrieve network stats
-            self.check.get_network_stats()
+            self.check.get_network_stats([])
 
             # Assert
             # .. 1 out of 4 network filtered in
